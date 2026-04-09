@@ -2,6 +2,7 @@
 
 import json
 import os
+import re
 import tempfile
 import uuid
 
@@ -12,6 +13,162 @@ from zotero_mcp._app import mcp
 from zotero_mcp import client as _client
 from zotero_mcp import utils as _utils
 from zotero_mcp.tools import _helpers
+
+
+def _render_inline(text: str) -> str:
+    """
+    Convert inline markdown to Zotero HTML (marks defined in marks.js).
+
+    Handles (priority order matters — longer/more-specific patterns first):
+    - ``[text](url)``   → ``<a href="url">text</a>``
+    - `` `code` ``      → ``<code>code</code>``
+    - ``~~text~~``      → ``<s>text</s>``
+    - ``**bold**``      → ``<strong>bold</strong>``
+    - ``*italic*``      → ``<em>italic</em>``
+    - ``_italic_``      → ``<em>italic</em>``
+    - ``$math$``        → ``<span class="math">$math$</span>``
+    - newlines          → ``<br/>``
+    """
+    _INLINE = re.compile(
+        r"\[([^\]]+?)\]\(([^)]+?)\)"    # [text](url)  — link
+        r"|`([^`\n]+?)`"                # `code`
+        r"|~~([^~\n]+?)~~"              # ~~strikethrough~~
+        r"|\*\*(.+?)\*\*"              # **bold**
+        r"|\*([^*\n]+?)\*"             # *italic*
+        r"|_([^_\n]+?)_"               # _italic_
+        r"|\$([^$\n]+?)\$"             # $math$
+    )
+
+    def _sub(m: re.Match) -> str:
+        if m.group(1) is not None:   # link
+            return f'<a href="{m.group(2)}">{m.group(1)}</a>'
+        if m.group(3) is not None:   # code
+            return f"<code>{m.group(3)}</code>"
+        if m.group(4) is not None:   # strikethrough
+            return f"<s>{m.group(4)}</s>"
+        if m.group(5) is not None:   # bold
+            return f"<strong>{m.group(5)}</strong>"
+        if m.group(6) is not None:   # italic *
+            return f"<em>{m.group(6)}</em>"
+        if m.group(7) is not None:   # italic _
+            return f"<em>{m.group(7)}</em>"
+        return f'<span class="math">${m.group(8)}$</span>'  # math
+
+    return _INLINE.sub(_sub, text).replace("\n", "<br/>")
+
+
+def _format_note_with_math(text: str) -> str:
+    """
+    Convert markdown-style text to HTML using Zotero's native elements.
+
+    Zotero 7's note-editor (prosemirror) schema (src/core/schema/nodes.js)
+    uses these specific HTML tags:
+    - Inline math:  ``<span class="math">$content$</span>``
+    - Display math: ``<pre class="math">$$content$$</pre>``
+    - Headings:     ``<h1>``–``<h6>``
+    - Bullet list:  ``<ul><li>…</li></ul>``
+    - Ordered list: ``<ol><li>…</li></ol>``
+    - Separator:    ``<hr>``
+    - Body text:    ``<p>`` with ``<br/>`` for in-paragraph line breaks
+
+    Markdown constructs recognised (paragraphs separated by blank lines):
+    - ``# Heading`` … ``######``       → ``<h1>`` … ``<h6>``
+    - ``---`` / ``***`` / ``___``      → ``<hr>``
+    - Lines starting with ``- `` / ``* `` → ``<ul><li>``
+    - Lines starting with ``1. `` etc. → ``<ol><li>``
+    - Standalone ``$$...$$``           → ``<pre class="math">``
+    - ``$$...$$`` mid-paragraph        → ``<pre class="math">`` (split out)
+    - Inline ``$...$``                 → ``<span class="math">``
+    - ``**bold**``, ``*italic*``, ``_italic_`` (via _render_inline)
+
+    Args:
+        text: Markdown-style text
+
+    Returns:
+        HTML string that Zotero's note editor renders correctly
+    """
+    paragraphs = text.split("\n\n")
+    html_parts = []
+
+    for para in paragraphs:
+        para = para.strip()
+        if not para:
+            continue
+
+        # Horizontal rule: ---, ***, or ___
+        if re.match(r"^(-{3,}|\*{3,}|_{3,})$", para):
+            html_parts.append("<hr>")
+            continue
+
+        # Single-line heading: #, ##, …, ######
+        heading_match = re.match(r"^(#{1,6})\s+(.+)$", para)
+        if heading_match and "\n" not in para:
+            level = len(heading_match.group(1))
+            content = _render_inline(heading_match.group(2).strip())
+            html_parts.append(f"<h{level}>{content}</h{level}>")
+            continue
+
+        # List detection: paragraph whose first non-empty line starts with
+        # "- "/"* " (unordered) or "N. " (ordered).  Continuation lines that
+        # do NOT start a new marker are appended to the previous item, so
+        # long bullet descriptions that wrap across lines are handled correctly.
+        lines = para.split("\n")
+        non_empty = [ln.strip() for ln in lines if ln.strip()]
+
+        def _parse_list(marker_re: str, strip_re: str) -> list[str] | None:
+            """Return list of item strings if paragraph looks like a list."""
+            if not non_empty or not re.match(marker_re, non_empty[0]):
+                return None
+            collected: list[str] = []
+            current: list[str] = []
+            for ln in non_empty:
+                if re.match(marker_re, ln):
+                    if current:
+                        collected.append(" ".join(current))
+                    current = [re.sub(strip_re, "", ln, count=1)]
+                else:
+                    current.append(ln)
+            if current:
+                collected.append(" ".join(current))
+            return collected
+
+        ul_items = _parse_list(r"^[-*]\s+", r"^[-*]\s+")
+        if ul_items:
+            li_html = "".join(f"<li>{_render_inline(it)}</li>" for it in ul_items)
+            html_parts.append(f"<ul>{li_html}</ul>")
+            continue
+
+        ol_items = _parse_list(r"^\d+\.\s+", r"^\d+\.\s+")
+        if ol_items:
+            li_html = "".join(f"<li>{_render_inline(it)}</li>" for it in ol_items)
+            html_parts.append(f"<ol>{li_html}</ol>")
+            continue
+
+        # Standalone display math block: entire paragraph is $$...$$
+        if para.startswith("$$") and para.endswith("$$") and len(para) > 4:
+            math_content = para[2:-2].strip()
+            html_parts.append(f'<pre class="math">$${math_content}$$</pre>')
+            continue
+
+        # Paragraph that may contain embedded $$...$$ or inline $...$.
+        # Split on $$...$$ first so block math is never inside a <p>.
+        segments = re.split(r"(\$\$.+?\$\$)", para, flags=re.DOTALL)
+        pending: list[str] = []
+
+        for seg in segments:
+            if re.match(r"^\$\$.+\$\$$", seg, re.DOTALL):
+                if pending:
+                    html_parts.append(f'<p>{"".join(pending)}</p>')
+                    pending = []
+                math_content = seg[2:-2].strip()
+                html_parts.append(f'<pre class="math">$${math_content}$$</pre>')
+            else:
+                pending.append(_render_inline(seg))
+
+        if pending:
+            html_parts.append(f'<p>{"".join(pending)}</p>')
+
+    return "".join(html_parts)
 
 
 @mcp.tool(
@@ -747,19 +904,13 @@ def create_note(
         except Exception:
             return f"Error: No item found with key: {item_key}"
 
-        # Format the note content with proper HTML
+        # Format the note content with proper HTML and KaTeX math support
         # If the note_text already has HTML, use it directly
         if "<p>" in note_text or "<div>" in note_text:
             html_content = note_text
         else:
-            # Convert plain text to HTML paragraphs - avoiding f-strings with replacements
-            paragraphs = note_text.split("\n\n")
-            html_parts = []
-            for p in paragraphs:
-                # Replace newlines with <br/> tags
-                p_with_br = p.replace("\n", "<br/>")
-                html_parts.append("<p>" + p_with_br + "</p>")
-            html_content = "".join(html_parts)
+            # Convert markdown-style text to HTML with proper KaTeX math handling
+            html_content = _format_note_with_math(note_text)
 
         # Use note_title as a visible heading so the argument is not ignored.
         clean_title = (note_title or "").strip()
